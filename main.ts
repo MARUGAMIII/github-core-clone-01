@@ -104,10 +104,31 @@ function jsonString(value: unknown): string {
 // --- pkt-line framing (git's wire format) -----------------------------------
 
 function pktLine(data: string | Buffer): Buffer {
-  const body = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+  if (typeof data === 'string') {
+    // One allocation: header + body in a single buffer.
+    const len = Buffer.byteLength(data, 'utf8') + 4;
+    const out = Buffer.alloc(len);
+    out.write(len.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    out.write(data, 4, 'utf8');
+    return out;
+  }
+  const body = data;
   const head = Buffer.alloc(4);
   head.write((body.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
   return Buffer.concat([head, body]);
+}
+
+/** The pkt-line length at `off` (-1 when the 4 header bytes are not hex).
+ * A manual nibble check: the regex this replaces ran on every packet header
+ * of every git exchange. */
+function pktLenAt(buf: Buffer, off: number): number {
+  const nib = (b: number): number => (b >= 48 && b <= 57 ? b - 48 : b >= 97 && b <= 102 ? b - 87 : b >= 65 && b <= 70 ? b - 55 : -1);
+  const a = nib(buf[off] as number);
+  const b = nib(buf[off + 1] as number);
+  const c = nib(buf[off + 2] as number);
+  const d = nib(buf[off + 3] as number);
+  if (a < 0 || b < 0 || c < 0 || d < 0) return -1;
+  return (a << 12) | (b << 8) | (c << 4) | d;
 }
 
 const PKT_FLUSH = Buffer.from('0000', 'ascii');
@@ -121,9 +142,8 @@ function decodePktLines(buf: Buffer): Pkt[] {
   let off = 0;
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('truncated pkt-line');
-    const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
-    const len = Number.parseInt(head, 16);
+    const len = pktLenAt(buf, off);
+    if (len < 0) throw new Error(`invalid pkt-line length ${JSON.stringify(buf.subarray(off, off + 4).toString('ascii'))}`);
     if (len === 0) {
       out.push({ kind: 'flush', payload: Buffer.alloc(0) });
       off += 4;
@@ -153,9 +173,8 @@ function splitAtFlush(buf: Buffer): { lines: string[]; rest: Buffer } {
   let off = 0;
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('truncated pkt-line');
-    const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error(`invalid pkt-line length ${JSON.stringify(head)}`);
-    const len = Number.parseInt(head, 16);
+    const len = pktLenAt(buf, off);
+    if (len < 0) throw new Error(`invalid pkt-line length ${JSON.stringify(buf.subarray(off, off + 4).toString('ascii'))}`);
     if (len === 0) return { lines, rest: buf.subarray(off + 4) };
     if (len === 1 || len === 2) {
       off += 4;
@@ -604,6 +623,7 @@ function planFetch(wants: string[], opts: FetchOptions): FetchPlan {
   const included = new Set<string>();
   const shallow = new Set<string>();
   // BFS over commits, tracking the shallowest generation each is reached at.
+  // An index pointer, not shift(): shifting a long queue is O(n) per step.
   const gen = new Map<string, number>();
   const queue: Array<{ oid: string; gen: number }> = [];
   for (const want of wants) {
@@ -636,8 +656,10 @@ function planFetch(wants: string[], opts: FetchOptions): FetchPlan {
     }
   };
 
-  while (queue.length > 0) {
-    const item = queue.shift() as { oid: string; gen: number };
+  let qi = 0;
+  while (qi < queue.length) {
+    const item = queue[qi] as { oid: string; gen: number };
+    qi += 1;
     const known = gen.get(item.oid);
     if (known !== undefined && known <= item.gen) continue;
     gen.set(item.oid, item.gen);
@@ -811,8 +833,10 @@ function mergeBase(a: string, b: string): string | null {
   // BFS from b by generation so the nearest common ancestor wins.
   const seen = new Set<string>();
   const queue: string[] = [b];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  let qi = 0;
+  while (qi < queue.length) {
+    const oid = queue[qi] as string;
+    qi += 1;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestorsA.has(oid)) return oid;
@@ -848,6 +872,10 @@ interface Issue {
   labels: string[];
   comments: Comment[];
   seq: number;
+  /** Serialized issueJson, cached: labels are immutable once created and an
+   * issue's fields change only at the sites that clear this (see touchIssue).
+   * The read workload fetches one issue 2,000 times, so this is its hot path. */
+  jsonCache: string | null;
 }
 
 interface PullRequest {
@@ -1029,6 +1057,7 @@ function createIssueRecord(repo: Repo, title: string, body: string, labels: stri
     labels: [...labels],
     comments: [],
     seq: nextItemSeq,
+    jsonCache: null,
   };
   nextGlobalId += 1;
   nextItemSeq += 1;
@@ -1199,7 +1228,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks, total)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks, total)));
     req.on('error', reject);
   });
 }
@@ -1448,12 +1477,10 @@ function fetchCacheKey(
 const fetchResponseCache = new Map<string, Buffer>();
 
 function cachedFetchPack(
-  repo: Repo,
+  key: string,
   wants: string[],
-  opts: { haves: string[]; depth?: number; deepenSince?: number; deepenNot: string[]; shallow: string[]; filter?: string },
   plan: FetchPlan,
 ): Buffer {
-  const key = fetchCacheKey('v2', repo, wants, opts);
   const hit = packCache.get(key);
   if (hit !== undefined) return hit;
   const pack = writePack(plan.objects);
@@ -1539,7 +1566,7 @@ function handleUploadPackV2(res: ServerResponse, repo: Repo, packets: Pkt[], lin
   }
   if (plan.objects.size > 0) {
     out.push(pktLine('packfile\n'));
-    const pack = cachedFetchPack(repo, wants, fetchOpts, plan);
+    const pack = cachedFetchPack(responseKey, wants, plan);
     out.push(sidebandPackets(1, pack));
   }
   out.push(PKT_FLUSH);
@@ -1612,7 +1639,7 @@ function handleUploadPackV0(res: ServerResponse, repo: Repo, packets: Pkt[], lin
   for (const oid of plan.shallow) out.push(pktLine(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) out.push(pktLine(`unshallow ${oid}\n`));
   if (plan.objects.size > 0) {
-    const pack = cachedFetchPack(repo, wants, fetchOpts, plan);
+    const pack = cachedFetchPack(responseKey, wants, plan);
     out.push(sidebandPackets(1, pack));
   }
   out.push(PKT_FLUSH);
@@ -1767,6 +1794,39 @@ function issueJson(item: NumberedItem, repo: Repo): Record<string, unknown> {
     html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${item.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${item.number}`,
   };
+}
+
+/** Cached serialization of one issue's REST JSON. Safe because an issue's
+ * rendered fields change only through touchIssue's call sites: the REST
+ * PATCH handler, the REST/GraphQL comment adds, and the GraphQL close.
+ * Labels are immutable once created (POST /labels 422s on an existing name)
+ * and an issue's label list is fixed at creation, so the label rendering
+ * inside the cached string can never go stale. */
+function cachedIssueJson(item: Issue, repo: Repo): string {
+  if (item.jsonCache === null) item.jsonCache = jsonString(issueJson(item, repo));
+  return item.jsonCache;
+}
+
+/** Serialized REST JSON for any numbered item: cached for issues, built
+ * fresh for pull requests (their rendering calls prConflicts). */
+function issueJsonString(item: NumberedItem, repo: Repo): string {
+  if (item.kind === 'issue') return cachedIssueJson(item, repo);
+  return jsonString(issueJson(item, repo));
+}
+
+/** Drop an issue's cached JSON after a mutation. No-op for pull requests. */
+function touchIssue(item: NumberedItem): void {
+  if (item.kind === 'issue') item.jsonCache = null;
+}
+
+/** Send a pre-serialized JSON body with sendJson's exact headers. */
+function sendCachedJson(res: ServerResponse, status: number, body: string): void {
+  requestCounter += 1;
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'x-github-request-id': `req-${requestCounter}`,
+  });
+  res.end(body);
 }
 
 function labelJson(label: Label | undefined): Record<string, unknown> {
@@ -2327,7 +2387,7 @@ async function handleRepoRoute(
           }
         }
         const issue = createIssueRecord(repo, title, body, labels);
-        sendJson(res, 201, issueJson(issue, repo));
+        sendCachedJson(res, 201, cachedIssueJson(issue, repo));
         return;
       }
       if (method === 'GET') {
@@ -2360,7 +2420,7 @@ async function handleRepoRoute(
         return;
       }
       if (method === 'GET') {
-        sendJson(res, 200, issueJson(item, repo));
+        sendCachedJson(res, 200, issueJsonString(item, repo));
         return;
       }
       if (method === 'PATCH') {
@@ -2370,7 +2430,8 @@ async function handleRepoRoute(
         if (title !== undefined) item.title = title;
         const body = bodyString(jsonBody, 'body');
         if (body !== undefined) item.body = body;
-        sendJson(res, 200, issueJson(item, repo));
+        touchIssue(item);
+        sendCachedJson(res, 200, issueJsonString(item, repo));
         return;
       }
       sendError(res, 404, 'Not Found');
@@ -2390,6 +2451,7 @@ async function handleRepoRoute(
         const comment: Comment = { id: nextGlobalId, body };
         nextGlobalId += 1;
         item.comments.push(comment);
+        touchIssue(item);
         sendJson(res, 201, commentJson(comment, repo, number));
         return;
       }
@@ -2912,6 +2974,7 @@ function resolveField(parent: GqlParent, field: GqlFieldSel): unknown {
       const found = findNumberedByGlobalId(issueId);
       if (found === undefined || found.item.kind !== 'issue') throw new GqlError('closeIssue: issue not found');
       found.item.state = 'closed';
+      touchIssue(found.item);
       return { __type: 'CloseIssuePayload', issue: { __type: 'Issue', repo: found.repo, item: found.item } };
     }
     if (name === 'createPullRequest') {
@@ -2961,6 +3024,7 @@ function resolveField(parent: GqlParent, field: GqlFieldSel): unknown {
       const comment: Comment = { id: nextGlobalId, body };
       nextGlobalId += 1;
       found.item.comments.push(comment);
+      touchIssue(found.item);
       return { __type: 'AddCommentPayload', commentEdge: { __type: 'CommentEdge', node: { __type: 'Comment', comment } } };
     }
     throw new GqlError(`Cannot query field "${name}" on type "Mutation".`);
